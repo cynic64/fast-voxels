@@ -1,0 +1,3 @@
+[submodule "external/render-c"]
+	path = external/render-c
+	url = https://github.com/cynic64/render-c
