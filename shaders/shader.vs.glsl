@@ -19,6 +19,7 @@ vec2 positions[6] = vec2[](
 layout (location = 0) out vec2 out_pos;
 
 void main() {
-        out_pos = positions[gl_VertexIndex];
-	gl_Position = vec4(out_pos, 0.0, 1.0);
+	gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+
+        out_pos = gl_Position.xy * 0.5 + 0.5;
 }

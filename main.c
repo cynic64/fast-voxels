@@ -1,3 +1,4 @@
+#include <vulkan/vulkan_core.h>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #include <vulkan/vulkan.h>
@@ -43,6 +44,7 @@ struct PushConstants {
 	vec4 iMouse;
 	float iFrame[1];
 	float iTime[1];
+	int32_t tex_width;
 };
 
 void sync_set_create(VkDevice device, struct SyncSet* sync_set) {
@@ -90,32 +92,6 @@ int main() {
 	VkRenderPass rpass;
 	rpass_color(base.device, swapchain.format, &rpass);
 
-        // Pipeline layout
-	VkPushConstantRange pushc_range = {0};
-        pushc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        pushc_range.offset = 0;
-        pushc_range.size = sizeof(struct PushConstants);
-
-        VkPipelineLayoutCreateInfo pipeline_layout_info = {0};
-        pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipeline_layout_info.pushConstantRangeCount = 1;
-        pipeline_layout_info.pPushConstantRanges = &pushc_range;
-
-        VkPipelineLayout pipeline_layout;
-        VkResult res = vkCreatePipelineLayout(base.device, &pipeline_layout_info, NULL, &pipeline_layout);
-        assert(res == VK_SUCCESS);
-
-        // Pipeline
-        struct PipelineSettings pipeline_settings = PIPELINE_SETTINGS_DEFAULT;
-
-	VkPipeline pipeline;
-	pipeline_create(base.device, &pipeline_settings,
-	                sizeof(shaders) / sizeof(shaders[0]), shaders,
-	                pipeline_layout, rpass, 0, &pipeline);
-
-        vkDestroyShaderModule(base.device, vs, NULL);
-        vkDestroyShaderModule(base.device, fs, NULL);
-
         // Framebuffers
         VkFramebuffer* framebuffers = malloc(swapchain.image_ct * sizeof(framebuffers[0]));
         for (int i = 0; i < swapchain.image_ct; i++) {
@@ -135,6 +111,135 @@ int main() {
         // Image fences
         VkFence* image_fences = malloc(swapchain.image_ct * sizeof(image_fences[0]));
         for (int i = 0; i < swapchain.image_ct; i++) image_fences[i] = VK_NULL_HANDLE;
+
+	// Texture for shader
+	const int tex_width = 1024;
+	// Using 1 byte per voxel
+	const int image_size = tex_width * tex_width;
+	struct Buffer tex_buf;
+	buffer_create(base.phys_dev, base.device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		      image_size, &tex_buf);
+
+	// Write some data
+	unsigned char *tex_buf_mapped;
+	vkMapMemory(base.device, tex_buf.mem, 0, tex_buf.size, 0, (void **) &tex_buf_mapped);
+	for (int i = 0; i < tex_width; i++) {
+		for (int j = 0; j < tex_width; j++) {
+			tex_buf_mapped[i * tex_width + j] = j % 2 == 0 ? 0x7f : 0x00;
+		}
+	}
+
+	vkUnmapMemory(base.device, tex_buf.mem);
+
+	// Create the actual image
+	struct Image tex;
+	image_create(base.phys_dev, base.device, VK_FORMAT_R8_UNORM, tex_width, tex_width,
+		     VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+		     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+		     1, VK_SAMPLE_COUNT_1_BIT, &tex);
+
+	// Copy buffer to image
+	image_trans(base.device, base.queue, base.cpool, tex.handle,
+		    VK_IMAGE_ASPECT_COLOR_BIT,
+		    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+		    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
+
+	image_copy_from_buffer(base.device, base.queue, base.cpool, VK_IMAGE_ASPECT_COLOR_BIT,
+			       tex_buf.handle, tex.handle, tex_width, tex_width);
+
+	image_trans(base.device, base.queue, base.cpool, tex.handle,
+		    VK_IMAGE_ASPECT_COLOR_BIT,
+		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 1);
+
+	// Create sampler
+	VkSamplerCreateInfo sampler_info = {0};
+	sampler_info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sampler_info.magFilter = VK_FILTER_NEAREST;
+	sampler_info.minFilter = VK_FILTER_NEAREST;
+	sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampler_info.unnormalizedCoordinates = VK_TRUE;
+	sampler_info.compareEnable = VK_FALSE;
+
+	VkSampler tex_sampler;
+	VkResult res = vkCreateSampler(base.device, &sampler_info, NULL, &tex_sampler);
+	assert(res == VK_SUCCESS);
+
+	// Create descriptors
+	VkDescriptorImageInfo set_desc_img = {0};
+	set_desc_img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	set_desc_img.imageView = tex.view;
+	set_desc_img.sampler = tex_sampler;
+
+	struct Descriptor set_desc = {0};
+	set_desc.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	set_desc.binding = 0;
+	set_desc.shader_stage_flags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	set_desc.image = set_desc_img;
+
+	// Create descriptor pool
+	VkDescriptorPoolSize dpool_size = {0};
+	dpool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	dpool_size.descriptorCount = 1;
+
+	VkDescriptorPoolCreateInfo dpool_info = {0};
+	dpool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	dpool_info.maxSets = CONCURRENT_FRAMES;
+	dpool_info.poolSizeCount = 1;
+	dpool_info.pPoolSizes = &dpool_size;
+
+	VkDescriptorPool dpool;
+	res = vkCreateDescriptorPool(base.device, &dpool_info, NULL, &dpool);
+	assert(res == VK_SUCCESS);
+
+	VkDescriptorSetLayoutBinding set_binding = {0};
+	set_binding.binding = 0;
+	set_binding.descriptorCount = 1;
+	set_binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	set_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	VkDescriptorSetLayout set_layout;
+	set_layout_create(base.device, 1, &set_binding, &set_layout);
+
+	// Finally create the set
+	VkDescriptorSet set;
+	set_create(base.device, dpool, set_layout, 1, &set_desc, &set);
+
+        // Pipeline layout
+	VkPushConstantRange pushc_range = {0};
+        pushc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushc_range.offset = 0;
+        pushc_range.size = sizeof(struct PushConstants);
+
+        VkPipelineLayoutCreateInfo pipeline_layout_info = {0};
+        pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.pushConstantRangeCount = 1;
+        pipeline_layout_info.pPushConstantRanges = &pushc_range;
+	pipeline_layout_info.setLayoutCount = 1;
+	pipeline_layout_info.pSetLayouts = &set_layout;
+
+        VkPipelineLayout pipeline_layout;
+        res = vkCreatePipelineLayout(base.device, &pipeline_layout_info, NULL,
+					      &pipeline_layout);
+        assert(res == VK_SUCCESS);
+
+        // Pipeline
+        struct PipelineSettings pipeline_settings = PIPELINE_SETTINGS_DEFAULT;
+
+	VkPipeline pipeline;
+	pipeline_create(base.device, &pipeline_settings,
+	                sizeof(shaders) / sizeof(shaders[0]), shaders,
+	                pipeline_layout, rpass, 0, &pipeline);
+
+        vkDestroyShaderModule(base.device, vs, NULL);
+        vkDestroyShaderModule(base.device, fs, NULL);
 
 	// Camera
 	struct CameraFly camera;
@@ -272,10 +377,13 @@ int main() {
 		pushc_data.iMouse[2] = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 		pushc_data.iFrame[0] = frame_ct;
 		pushc_data.iTime[0] = timer_get_elapsed(&start_time);
+		pushc_data.tex_width = tex_width;
 
 		vkCmdPushConstants(cbuf, pipeline_layout,
 				   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		                   0, sizeof(struct PushConstants), &pushc_data);
+		vkCmdBindDescriptorSets(cbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1,
+					&set, 0, NULL);
                 vkCmdDraw(cbuf, 6, 1, 0, 0);
 
                 vkCmdEndRenderPass(cbuf);
@@ -346,6 +454,12 @@ int main() {
         for (int i = 0; i < swapchain.image_ct; i++) {
                 vkDestroyFramebuffer(base.device, framebuffers[i], NULL);
         }
+
+	vkDestroyDescriptorSetLayout(base.device, set_layout, NULL);
+	vkDestroyDescriptorPool(base.device, dpool, NULL);
+	vkDestroySampler(base.device, tex_sampler, NULL);
+	image_destroy(base.device, &tex);
+	buffer_destroy(base.device, &tex_buf);
 
         base_destroy(&base);
 
