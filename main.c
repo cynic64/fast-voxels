@@ -4,6 +4,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cglm/cglm.h>
+#include <math.h>
 
 #include "external/render-c/src/base.h"
 #include "external/render-c/src/buffer.h"
@@ -45,6 +46,7 @@ struct PushConstants {
 	float iFrame[1];
 	float iTime[1];
 	int32_t tex_width;
+	int32_t tex_layer;
 };
 
 void sync_set_create(VkDevice device, struct SyncSet* sync_set) {
@@ -113,20 +115,27 @@ int main() {
         for (int i = 0; i < swapchain.image_ct; i++) image_fences[i] = VK_NULL_HANDLE;
 
 	// Texture for shader
-	const int tex_width = 1024;
+	const int tex_width = 256;
 	// Using 1 byte per voxel
-	const int image_size = tex_width * tex_width;
+	const int tex_size = tex_width * tex_width * tex_width;
 	struct Buffer tex_buf;
 	buffer_create(base.phys_dev, base.device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 		      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-		      image_size, &tex_buf);
+		      tex_size, &tex_buf);
 
 	// Write some data
 	unsigned char *tex_buf_mapped;
 	vkMapMemory(base.device, tex_buf.mem, 0, tex_buf.size, 0, (void **) &tex_buf_mapped);
-	for (int i = 0; i < tex_width; i++) {
+	for (int idx = 0, i = 0; i < tex_width; i++) {
 		for (int j = 0; j < tex_width; j++) {
-			tex_buf_mapped[i * tex_width + j] = j % 2 == 0 ? 0x7f : 0x00;
+			for (int k = 0; k < tex_width; k++) {
+				float i_dist = i - tex_width * 0.5;
+				float j_dist = j - tex_width * 0.5;
+				float k_dist = k - tex_width * 0.5;
+				float dist = sqrtf(i_dist*i_dist + j_dist*j_dist + k_dist*k_dist);
+				float max_dist = sqrtf(tex_width*tex_width*0.25*3);
+				tex_buf_mapped[idx++] = dist / max_dist * 0xff;
+			}
 		}
 	}
 
@@ -134,7 +143,8 @@ int main() {
 
 	// Create the actual image
 	struct Image tex;
-	image_create(base.phys_dev, base.device, VK_FORMAT_R8_UNORM, tex_width, tex_width,
+	image_create(base.phys_dev, base.device, VK_FORMAT_R8_UNORM, VK_IMAGE_TYPE_3D,
+		     tex_width, tex_width, tex_width,
 		     VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
 		     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 		     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -149,7 +159,7 @@ int main() {
 		    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1);
 
 	image_copy_from_buffer(base.device, base.queue, base.cpool, VK_IMAGE_ASPECT_COLOR_BIT,
-			       tex_buf.handle, tex.handle, tex_width, tex_width);
+			       tex_buf.handle, tex.handle, tex_width, tex_width, tex_width);
 
 	image_trans(base.device, base.queue, base.cpool, tex.handle,
 		    VK_IMAGE_ASPECT_COLOR_BIT,
@@ -249,13 +259,12 @@ int main() {
 	double last_mouse_x, last_mouse_y;
 	glfwGetCursorPos(window, &last_mouse_x, &last_mouse_y);
 
-	// Exponent for SDF
-	float sdf_exp = 1.0F;
-
 	// Main loop
         int frame_ct = 0;
         struct timespec start_time = timer_start();
         struct timespec last_frame_time = timer_start();
+
+	int tex_layer = 0;
 
         int must_recreate = 0;
         while (!glfwWindowShouldClose(window)) {
@@ -308,8 +317,8 @@ int main() {
         	if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) cam_movement[0] -= MOVEMENT_SPEED;
         	if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) cam_movement[0] += MOVEMENT_SPEED;
 
-        	if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS) sdf_exp += delta * 0.2;
-        	if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) sdf_exp -= delta * 0.2;
+		if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) tex_layer =
+									  (tex_layer + 1) % tex_width;
 
         	// Update camera
         	camera_fly_update(&camera,
@@ -378,6 +387,7 @@ int main() {
 		pushc_data.iFrame[0] = frame_ct;
 		pushc_data.iTime[0] = timer_get_elapsed(&start_time);
 		pushc_data.tex_width = tex_width;
+		pushc_data.tex_layer = tex_layer;
 
 		vkCmdPushConstants(cbuf, pipeline_layout,
 				   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
